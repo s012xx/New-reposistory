@@ -16,14 +16,22 @@ from openai import OpenAI
 # ==============================
 # 環境変数（推奨）
 # ==============================
-LINE_CHANNEL_SECRET = "a57f15e4aea3dbb3051f89cbb4f9f2e4"
-LINE_CHANNEL_ACCESS_TOKEN = "y10fR1TloXSab+7Q3Yn9UtcSpbDQa7N/jdqjW+JkRsT/bNrKtNj1WVbdd8dFQ7Yb/9D39BtiSKvdagiGlo+Oce/HDNTtwOzOAK0+MF6728Jv3zcy0hJ/fRiBPLhuN5Xc/m6SsoSUt0vbIBLzEkiSCQdB04t89/1O/w1cDnyilFU="
-OPENAI_API_KEY = os.getenv("OPENAI=API=KEY","")
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
-if not LINE_CHANNEL_SECRET or not LINE_CHANNEL_ACCESS_TOKEN or not OPENAI_API_KEY:
+missing = []
+for k in ["LINE_CHANNEL_SECRET", "LINE_CHANNEL_ACCESS_TOKEN", "OPENAI_API_KEY"]:
+    if not os.getenv(k):
+        missing.append(k)
+
+print("ENV CHECK:", {k: bool(os.getenv(k)) for k in ["LINE_CHANNEL_SECRET", "LINE_CHANNEL_ACCESS_TOKEN", "OPENAI_API_KEY"]})
+print("MISSING KEYS:", missing)
+
+if missing:
     raise RuntimeError(
-        "環境変数が不足しています。"
-        " LINE_CHANNEL_SECRET / LINE_CHANNEL_ACCESS_TOKEN / OPENAI_API_KEY を設定してください。"
+        "環境変数が不足しています。 "
+        "LINE_CHANNEL_SECRET / LINE_CHANNEL_ACCESS_TOKEN / OPENAI_API_KEY を設定してください。"
     )
 
 # ==============================
@@ -385,3 +393,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=False)
     
+
