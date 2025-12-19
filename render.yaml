@@ -5,4 +5,5 @@ services:
     plan: free
     buildCommand: pip install -r requirements.txt
 
-    startCommand: python3 line_bot.py
+    startCommand: gunicorn line_bot:app --bind 0.0.0.0:$PORT
+
