@@ -1,12 +1,9 @@
-import os
 from flask import Flask, request, abort
-from linebot import LineBotApi, WebhookHandler
-from linebot.exceptions import InvalidSignatureError
-from linebot.models import MessageEvent, TextMessage, TextSendMessage
+import os
+from collections import defaultdict
 
-# ======================
-# 環境変数
-# ======================
+app = Flask(__name__)
+
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -14,214 +11,149 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not all([LINE_CHANNEL_SECRET, LINE_CHANNEL_ACCESS_TOKEN, OPENAI_API_KEY]):
     raise RuntimeError("環境変数が不足しています")
 
-# ======================
-# LINE設定
-# ======================
-app = Flask(__name__)
-line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
-handler = WebhookHandler(LINE_CHANNEL_SECRET)
-
-# ======================
-# プラン設定
-# ======================
-PLAN_LIMITS = {
-    "ライト": 1,
-    "シルバー": 3,
-    "ゴールド": 999
-}
-
 BASE_LINKS = {
-    "ライト": "https://your-base-link/light",
-    "シルバー": "https://your-base-link/silver",
-    "ゴールド": "https://your-base-link/gold"
+    "ライト": "https://fortune907.base.shop/items/128865860",
+    "シルバー": "https://fortune907.base.shop/items/128866117",
+    "ゴールド": "https://fortune907.base.shop/items/128866188"
 }
 
-# ======================
-# ユーザー状態（簡易）
-# ======================
-user_states = {}
+user_state = defaultdict(lambda: {
+    "answers": [],
+    "free_done": False,
+    "plan": None,
+    "count": 0
+})
 
-def get_state(user_id):
-    if user_id not in user_states:
-        user_states[user_id] = {
-            "answers": {},
-            "free_done": False,
-            "plan": None,
-            "used": 0
-        }
-    return user_states[user_id]
+FREE_FORTUNE = """無料鑑定をお届けします🔮
 
-# ======================
-# テキスト定義
-# ======================
-FREE_READING = """無料鑑定をお届けします🔮
+あなたの流れを丁寧に読み解くと、今は
+「一度立ち止まり、方向を整える大切な節目」。
 
-あなたの今の流れを見ると、
-「一度立ち止まり、方向を整える時期」に入っています。
+これまで積み重ねてきた努力や我慢は、
+決して間違っていません。
+ただ、環境や人の期待に合わせる中で、
+本来のあなたの感覚が少し後ろに下がっているようです。
 
-やるべきことは見えているのに、
-気持ちが追いつかず、
-どこかモヤモヤした感覚を抱えやすいタイミング。
-
-これは停滞ではなく、
-次のステージへ進む前の調整期間です。
+最近、同じことで何度も迷ったり、
+答えが分かっているのに決断できない感覚はありませんか？
+それは運気が停滞しているのではなく、
+「選び直す準備」が整ってきたサインです。
 
 ここから先は、
-もう少し深く読み解くことで
-✔ なぜ今この状態なのか
-✔ どんな選択が流れを変えるのか
-がはっきりしてきます。
+・どこを手放すと楽になるのか
+・今後どんな流れが強まるのか
+・選択を誤らないためのポイント
+を、より深く読み解く必要があります。
+
+ここから先は【有料鑑定】になります。
+
+番号かプラン名で選んでください👇
+1️⃣ ライト
+2️⃣ シルバー
+3️⃣ ゴールド
+
+迷う場合は「おすすめ」と送ってください。
 """
 
-PAID_READING = """本鑑定をお届けします🔮
+FULL_FORTUNE = """本鑑定をお届けします🔮
 
-あなたの流れを丁寧に読み解くと、
-今は「人生の軸を切り替える直前」にいます。
+あなたの運命の流れを深く読み解くと、
+今は「人生の軸を整え直す転換期」に入っています。
 
 これまでのあなたは、
-周囲との期待や安定を優先し、
+周囲とのバランスを大切にしながら、
 自分の本音を後回しにしてきました。
+その姿勢は間違いではありませんが、
+今後も同じやり方を続けると、
+心だけが先に疲れてしまいます。
 
-それは優しさでもあり、
-同時に自分を抑える癖でもありました。
+今後数ヶ月で重要になるのは、
+「全部を守ろうとしないこと」。
+あなたが本当に守るべきものは、
+人ではなく、あなた自身の感覚です。
 
-今このタイミングで
-小さくでも「選び直す行動」を取ると、
-人間関係・仕事・環境が
-あなたに合う形へと静かに再編されていきます。
+現実面では、
+・環境の変化
+・人間関係の距離感
+・役割の見直し
+が同時に起こりやすい時期。
 
-焦る必要はありません。
-正解を探すより、
-「違和感を無視しないこと」が
-これからの運気を大きく動かします。
+ここで無理に答えを急がず、
+一つずつ整理することで、
+運の流れは自然と好転していきます。
 
-ここまでが今回の本鑑定です🔮
+焦らなくて大丈夫。
+あなたの選択は、ゆっくりでも確実に
+未来を良い方向へ導いていきます。
+
+必要なときに、また「鑑定して」と送ってください。
 """
 
-# ======================
-# Webhook
-# ======================
 @app.route("/callback", methods=["POST"])
 def callback():
-    signature = request.headers.get("X-Line-Signature")
-    body = request.get_data(as_text=True)
-    try:
-        handler.handle(body, signature)
-    except InvalidSignatureError:
-        abort(400)
-    return "OK"
+    data = request.json
+    user_id = data["user"]
+    text = data["message"].strip()
 
-# ======================
-# メッセージ処理
-# ======================
-@handler.add(MessageEvent, message=TextMessage)
-def handle_message(event):
-    user_id = event.source.user_id
-    text = event.message.text.strip()
-    state = get_state(user_id)
+    state = user_state[user_id]
 
-    # リセット
     if text == "リセット":
-        user_states[user_id] = {
-            "answers": {},
+        user_state[user_id] = {
+            "answers": [],
             "free_done": False,
             "plan": None,
-            "used": 0
+            "count": 0
         }
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text="リセットしました。最初から始められます🔄")
-        )
-        return
+        return "リセットしました"
 
-    # 質問収集
     if not state["free_done"]:
-        if "①" not in state["answers"]:
-            state["answers"]["①"] = text
-            reply = "ありがとうございます✨ 続けて教えてください。\n\n② いつ頃からモヤモヤしていますか？"
-        elif "②" not in state["answers"]:
-            state["answers"]["②"] = text
-            reply = "ありがとうございます✨\n\n③ 最終的にどうなれたら理想ですか？"
-        elif "③" not in state["answers"]:
-            state["answers"]["③"] = text
+        if len(state["answers"]) < 3:
+            state["answers"].append(text)
+            if len(state["answers"]) < 3:
+                return "ありがとうございます✨ 残りも教えてください。"
             state["free_done"] = True
-            reply = (
-                FREE_READING +
-                "\n\nここから先は【有料鑑定】になります。\n\n"
-                "1️⃣ ライト\n2️⃣ シルバー\n3️⃣ ゴールド\n\n"
-                "迷う場合は「おすすめ」と送ってください👇"
-            )
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
-        return
+            return FREE_FORTUNE
 
-    # おすすめ
-    if text == "おすすめ":
-        reply = (
-            "継続的に流れを見ていきたい方には\n"
-            "【シルバープラン】がおすすめです🔮\n\n"
-            f"{BASE_LINKS['シルバー']}\n\n"
-            "購入後「購入しました」と送ってください。"
-        )
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
-        return
-
-    # プラン選択
-    if text in PLAN_LIMITS:
+    if text in ["ライト", "シルバー", "ゴールド"]:
         state["plan"] = text
-        state["used"] = 0
-        reply = (
-            f"{text}プランを選択しました✨\n\n"
-            "本鑑定をご希望の際は\n"
-            "【鑑定して】と送ってください🔮"
-        )
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
-        return
+        return f"""【{text}プラン】を選択されました。
 
-    # 購入完了
+こちらからご購入ください👇
+{BASE_LINKS[text]}
+
+購入後「購入しました」と送ってください。"""
+
     if text == "購入しました":
-        reply = (
-            "ありがとうございます✨\n\n"
-            "本鑑定をご希望のタイミングで\n"
-            "【鑑定して】と送ってください🔮"
-        )
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
-        return
+        return "ありがとうございます✨ 鑑定したいタイミングで「鑑定して」と送ってください。"
 
-    # 本鑑定
     if text == "鑑定して":
-        if not state["plan"]:
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(text="先にプランを選択してください。")
-            )
-            return
+        if state["plan"] == "ライト" and state["count"] >= 1:
+            return END_MESSAGE()
+        if state["plan"] == "シルバー" and state["count"] >= 3:
+            return END_MESSAGE()
+        state["count"] += 1
+        return FULL_FORTUNE
 
-        if state["used"] >= PLAN_LIMITS[state["plan"]]:
-            reply = (
-                "このプランの鑑定回数は終了しました🔮\n\n"
-                "🔁 継続・ランクアップはこちら👇\n"
-                "1️⃣ ライト\n2️⃣ シルバー\n3️⃣ ゴールド\n\n"
-                "迷う場合は「おすすめ」と送ってください。\n\n"
-                f"{BASE_LINKS['ライト']}\n"
-                f"{BASE_LINKS['シルバー']}\n"
-                f"{BASE_LINKS['ゴールド']}"
-            )
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
-            return
+    if text == "おすすめ":
+        return """今の流れを見る限り、
+一度きりよりも、状況に合わせて見直せる
+【シルバープラン】が合っています。
 
-        state["used"] += 1
-        reply = PAID_READING + "\n\n🔔 鑑定はここで一区切りです。"
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
-        return
+無理に決めなくて大丈夫です。
+番号かプラン名で選んでください👇
+1️⃣ ライト
+2️⃣ シルバー
+3️⃣ ゴールド"""
 
-    # その他
-    line_bot_api.reply_message(
-        event.reply_token,
-        TextSendMessage(text="内容を入力するか「鑑定して」と送ってください🔮")
-    )
+    return "必要な場合は「鑑定して」と送ってください。"
 
-# ======================
-# 起動
-# ======================
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+def END_MESSAGE():
+    return """このプランの鑑定回数は終了しました。
+
+🔮 継続やランクアップも可能です。
+1️⃣ ライト
+2️⃣ シルバー
+3️⃣ ゴールド
+
+おすすめを聞いてもOKです。"""
+
