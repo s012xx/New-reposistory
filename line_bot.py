@@ -1,43 +1,150 @@
 import os
-import openai
 from flask import Flask, request, abort
-
-from linebot import (
-    LineBotApi, WebhookHandler
-)
+from linebot import LineBotApi, WebhookHandler
+from linebot.models import MessageEvent, TextMessage, TextSendMessage
 from linebot.exceptions import InvalidSignatureError
-from linebot.models import (
-    MessageEvent, TextMessage, TextSendMessage
-)
+from openai import OpenAI
 
-# ========= 環境変数 =========
+# =====================
+# 環境変数チェック
+# =====================
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 if not all([LINE_CHANNEL_SECRET, LINE_CHANNEL_ACCESS_TOKEN, OPENAI_API_KEY]):
-    raise ValueError("環境変数が不足しています。")
+    raise RuntimeError(
+        "環境変数が不足しています。 "
+        "LINE_CHANNEL_SECRET / LINE_CHANNEL_ACCESS_TOKEN / OPENAI_API_KEY を設定してください。"
+    )
 
-openai.api_key = OPENAI_API_KEY
-
+# =====================
+# 初期化
+# =====================
 app = Flask(__name__)
-
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ========= ユーザー状態管理（簡易） =========
+# =====================
+# ユーザー状態管理
+# =====================
 user_states = {}
 
-def reset_user(user_id):
+def get_state(user_id):
+    if user_id not in user_states:
+        user_states[user_id] = {
+            "step": "start",
+            "answers": {},
+            "selected_plan": None
+        }
+    return user_states[user_id]
+
+def reset_state(user_id):
     user_states[user_id] = {
-        "step": "free_intro",
-        "answers": {}
+        "step": "start",
+        "answers": {},
+        "selected_plan": None
     }
 
-# ========= Webhook =========
+# =====================
+# メッセージ生成
+# =====================
+def start_message():
+    return (
+        "はじめまして🔮 運命ナビ占い・フォーチュンです。\n\n"
+        "まずは【無料鑑定】から始めます。\n"
+        "状況を把握するために、次の【3つ】を教えてください。\n\n"
+        "① 今いちばん気になっていること\n"
+        "② いつ頃からモヤモヤしていますか？\n"
+        "③ 最終的にどうなれたら理想ですか？\n\n"
+        "※まとめて送っても、1つずつでも大丈夫です。"
+    )
+
+def need_more_answers(state):
+    missing = [q for q in ["1", "2", "3"] if q not in state["answers"]]
+    return missing
+
+def free_result_message():
+    return (
+        "🔮【無料鑑定結果】\n\n"
+        "今のあなたは「気持ちと現実のズレ」に気づき始めている段階です。\n"
+        "流れ自体は止まっていませんが、判断を先送りにしやすい時期。\n\n"
+        "このまま曖昧にすると、同じ悩みを繰り返しやすい暗示があります。\n"
+        "ただし、ポイントを整理すれば流れは十分に変えられます。\n\n"
+        "ここまでが【無料鑑定】です✨"
+    )
+
+def plan_simple_message():
+    return (
+        "ここから先は【有料鑑定】になります。\n\n"
+        "番号かプラン名で選んでください👇\n"
+        "1️⃣ ライト\n"
+        "2️⃣ シルバー\n"
+        "3️⃣ ゴールド\n\n"
+        "迷う場合は「おすすめ」と送ってください。"
+    )
+
+def plan_detail_message():
+    return (
+        "【プラン詳細】\n\n"
+        "1️⃣ ライト（2,000円）\n"
+        "・1テーマを丁寧に鑑定\n"
+        "・現状整理と近い未来を明確にしたい方\n\n"
+        "2️⃣ シルバー（4,000円 / 2週間・3回）\n"
+        "・状況が動くたびに再鑑定OK\n"
+        "・恋愛や人間関係の変化が気になる方\n\n"
+        "3️⃣ ゴールド（6,000円 / 2週間）\n"
+        "・相談し放題\n"
+        "・人生全体を整えたい方"
+    )
+
+def payment_message(plan):
+    links = {
+        "light": "https://fortune907.base.shop/items/128865860",
+        "silver": "https://fortune907.base.shop/items/128866117",
+        "gold": "https://fortune907.base.shop/items/128866188"
+    }
+
+    names = {
+        "light": "ライトプラン（2,000円）",
+        "silver": "シルバープラン（4,000円）",
+        "gold": "ゴールドプラン（6,000円）"
+    }
+
+    return (
+        f"✨ {names[plan]} を選びました。\n\n"
+        "以下のBASEショップからお支払いをお願いします👇\n"
+        f"{links[plan]}\n\n"
+        "お支払い完了後、\n"
+        "【支払いました】と送ってください。\n"
+        "確認後、本鑑定に入ります🔮"
+    )
+
+def paid_hearing_message():
+    return (
+        "ありがとうございます✨\n\n"
+        "それでは【本鑑定】に入ります。\n"
+        "鑑定したいテーマや、特に深く知りたい点があれば教えてください。\n\n"
+        "（例：相手の気持ち／今後の展開／選択の判断など）"
+    )
+
+def generate_paid_reading(prompt):
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "あなたは経験豊富な占い師です。核心を突きつつ、丁寧で現実的な鑑定を行ってください。"},
+            {"role": "user", "content": prompt}
+        ]
+    )
+    return response.choices[0].message.content
+
+# =====================
+# Webhook
+# =====================
 @app.route("/callback", methods=["POST"])
 def callback():
-    signature = request.headers.get("X-Line-Signature")
+    signature = request.headers["X-Line-Signature"]
     body = request.get_data(as_text=True)
 
     try:
@@ -47,178 +154,115 @@ def callback():
 
     return "OK"
 
-# ========= メイン処理 =========
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     user_id = event.source.user_id
     text = event.message.text.strip()
+    state = get_state(user_id)
 
-    # 初回 or 状態なし
-    if user_id not in user_states:
-        reset_user(user_id)
-
-    state = user_states[user_id]
-
-    # ===== リセット =====
-    if text in ["リセット", "最初から", "やり直し", "もう一回"]:
-        reset_user(user_id)
-        reply(event, intro_message())
+    # リセット
+    if text.lower() in ["リセット", "reset"]:
+        reset_state(user_id)
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text="リセットしました。最初から始めます🔁\n\n" + start_message())
+        )
         return
 
-    # ===== フロー分岐 =====
-    if state["step"] == "free_intro":
-        reply(event, hearing_message())
+    # スタート
+    if state["step"] == "start":
         state["step"] = "free_hearing"
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=start_message()))
         return
 
+    # 無料ヒアリング（3項目揃うまで待つ）
     if state["step"] == "free_hearing":
-        collect_answers(state, text)
-        if len(state["answers"]) < 3:
-            reply(event, "ありがとうございます。続けて教えてください🌿")
+        if "1" not in state["answers"]:
+            state["answers"]["1"] = text
+        elif "2" not in state["answers"]:
+            state["answers"]["2"] = text
+        elif "3" not in state["answers"]:
+            state["answers"]["3"] = text
+
+        missing = need_more_answers(state)
+        if missing:
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text="ありがとうございます。続けて教えてください✨")
+            )
             return
         else:
-            reply(event, free_reading(state["answers"]))
-            state["step"] = "plan_guide"
+            state["step"] = "free_result"
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text=free_result_message())
+            )
             return
 
-    if state["step"] == "plan_guide":
-        reply(event, plan_message())
+    # プラン案内
+    if state["step"] == "free_result":
         state["step"] = "wait_plan"
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=plan_simple_message())
+        )
         return
 
+    # プラン選択
     if state["step"] == "wait_plan":
-        plan = normalize_plan(text)
-        if not plan:
-            reply(event, "「ライト」「シルバー」「ゴールド」または「おすすめ」と送ってください😊")
+        t = text.lower()
+        if t in ["1", "ライト", "light"]:
+            plan = "light"
+        elif t in ["2", "シルバー", "silver"]:
+            plan = "silver"
+        elif t in ["3", "ゴールド", "gold"]:
+            plan = "gold"
+        elif "おすすめ" in t:
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text="迷ったら【シルバー】がおすすめです。\n\n" + plan_detail_message())
+            )
             return
-
-        if plan == "recommend":
-            reply(event, recommend_message())
+        else:
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text="番号（1〜3）かプラン名で選んでください😊")
+            )
             return
 
         state["selected_plan"] = plan
-        reply(event, paid_hearing_message())
-        state["step"] = "paid_hearing"
+        state["step"] = "wait_payment"
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=payment_message(plan))
+        )
         return
 
+    # 支払い待ち
+    if state["step"] == "wait_payment":
+        if "支払" in text:
+            state["step"] = "paid_hearing"
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text=paid_hearing_message())
+            )
+        else:
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text="お支払い後に【支払いました】と送ってください✨")
+            )
+        return
+
+    # 本鑑定
     if state["step"] == "paid_hearing":
-        state["paid_text"] = text
-        reply(event, paid_reading(text))
-        state["step"] = "done"
+        reading = generate_paid_reading(text)
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=reading)
+        )
         return
 
-    # ===== 想定外 =====
-    reply(event, "少し分かりづらかったかもですね😊\n「リセット」と送ると最初からやり直せます。")
 
-# ========= メッセージ群 =========
-
-def reply(event, text):
-    line_bot_api.reply_message(
-        event.reply_token,
-        TextSendMessage(text=text)
-    )
-
-def intro_message():
-    return (
-        "はじめまして✨\n"
-        "ここでは恋愛・相性・仕事・人生の流れを\n"
-        "やさしく、必要な部分はしっかり鑑定します。\n\n"
-        "まずは【無料鑑定】からどうぞ🌿"
-    )
-
-def hearing_message():
-    return (
-        "状況を正しく読み取るために、\n"
-        "【3つだけ】教えてください🌿\n\n"
-        "① 今いちばん気になっていること\n"
-        "② いつ頃からモヤモヤしていますか？\n"
-        "③ 最終的にどうなれたら理想ですか？\n\n"
-        "まとめて送っても、1つずつでも大丈夫です。"
-    )
-
-def collect_answers(state, text):
-    answers = state["answers"]
-    if "1" not in answers:
-        answers["1"] = text
-    elif "2" not in answers:
-        answers["2"] = text
-    elif "3" not in answers:
-        answers["3"] = text
-
-def free_reading(answers):
-    return (
-        "教えてくれてありがとうございます。\n\n"
-        "今の流れを占いの視点でみると、\n"
-        "あなたは少し『考えすぎ』の状態に入っています。\n\n"
-        "本来は直感が鋭いのに、\n"
-        "今は不安が先に立ち、選択肢を狭めているようです。\n\n"
-        "このまま進むと、\n"
-        "✔ 無理に決める\n"
-        "✔ 後から違和感が出る\n"
-        "という流れになりやすいです。\n\n"
-        "ここから先では、\n"
-        "・どう整えるか\n"
-        "・いつ動くとよいか\n"
-        "・相性や未来の流れ\n"
-        "まで詳しく読み解けます。"
-    )
-
-def plan_message():
-    return (
-        "より詳しく鑑定するために、\n"
-        "3つのプランをご用意しています。\n\n"
-        "1️⃣ ライト（2,000円）\n"
-        "2️⃣ シルバー（4,000円）⭐おすすめ\n"
-        "3️⃣ ゴールド（6,000円）\n\n"
-        "「ライト」「シルバー」「ゴールド」\n"
-        "または「おすすめ」と送ってください😊"
-    )
-
-def normalize_plan(text):
-    t = text.lower()
-    if "おすすめ" in t:
-        return "recommend"
-    if "ライト" in t or t == "1":
-        return "light"
-    if "シルバー" in t or t == "2":
-        return "silver"
-    if "ゴールド" in t or t == "3":
-        return "gold"
-    return None
-
-def recommend_message():
-    return (
-        "今のお話を踏まえると、\n"
-        "シルバープランがいちばん合っています🌿\n\n"
-        "理由は、\n"
-        "・テーマが1つに絞りきれていない\n"
-        "・感情と状況にズレがある\n"
-        "・タイミングを見極めたい\n\n"
-        "この3点が強く出ているからです。\n\n"
-        "ご希望があれば教えてください😊"
-    )
-
-def paid_hearing_message():
-    return (
-        "では本鑑定に入ります🔮\n\n"
-        "次のことを教えてください。\n"
-        "・特に知りたいテーマ\n"
-        "・関係する相手がいればその関係性\n"
-        "・いつ頃までに知りたいか\n\n"
-        "思いつく範囲で大丈夫です。"
-    )
-
-def paid_reading(text):
-    return (
-        "お待たせしました。\n"
-        "本鑑定の結果をお伝えします。\n\n"
-        "あなたは今、人生の流れが切り替わる\n"
-        "とても大切なタイミングにいます。\n\n"
-        "（ここに占い結果を生成・追加）\n\n"
-        "必要であれば、追加で読み解くこともできます🌙"
-    )
-
-# ========= 起動 =========
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+    app.run(host="0.0.0.0", port=5000)
 
