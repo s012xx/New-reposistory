@@ -3,210 +3,189 @@ from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
+from openai import OpenAI
 
-# =====================
-# 環境変数チェック
-# =====================
+# ========= 環境変数 =========
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 if not all([LINE_CHANNEL_SECRET, LINE_CHANNEL_ACCESS_TOKEN, OPENAI_API_KEY]):
-    raise Exception("環境変数が不足しています。")
+    raise ValueError("環境変数が不足しています。")
 
+# ========= 初期化 =========
 app = Flask(__name__)
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-# =====================
-# 簡易ユーザー管理（メモリ）
-# =====================
-user_states = {}
+# ========= 状態管理（簡易） =========
+user_state = {}
 
-def init_user(user_id):
-    user_states[user_id] = {
-        "answers": {},
-        "phase": "question",
-        "plan": None,
-        "remaining": 0
-    }
+# ========= 定数 =========
+BASE_LINKS = {
+    "ライト": "https://fortune907.base.shop/items/128865860",
+    "シルバー": "https://fortune907.base.shop/items/128866117",
+    "ゴールド": "https://fortune907.base.shop/items/128866188",
+}
 
-# =====================
-# Webhook
-# =====================
+PLAN_LIMITS = {
+    "ライト": 1,
+    "シルバー": 3,
+    "ゴールド": 999
+}
+
+# ========= 鑑定文 =========
+FREE_READING_TEXT = """無料鑑定をお届けします🔮
+
+あなたの流れを読み解くと、今は
+「一度立ち止まり、方向を整えるタイミング」にいます。
+
+ここ最近、
+✔ 気持ちは前に進みたいのに、行動が追いつかない
+✔ 決めたはずのことに、また迷いが出てくる
+そんな感覚はありませんか？
+
+これは停滞ではなく、
+次の段階に進む前の“調整期間”です。
+
+あなたの場合、
+外から見た状況と、内側の本音に
+少しズレが生まれているため、
+無意識にブレーキをかけている状態が見えます。
+
+ただ、流れそのものは悪くありません。
+むしろ今は、
+「本当に必要なものだけを残す」
+という大切な整理が進んでいます。
+
+ここから先は、
+あなた個人の状況・選択肢・タイミングを
+さらに具体的に読み解いていくことで、
+迷いを減らし、行動に移しやすくなります。
+"""
+
+PAID_READING_TEXT = """本鑑定をお届けします🔮
+
+あなたの流れを深く読み解くと、
+今は「人生の流れが切り替わる直前」にいます。
+
+これまでのあなたは、
+自分よりも周囲を優先し、
+状況に合わせて選択してきた場面が多かったはずです。
+
+その積み重ねは決して無駄ではありませんが、
+同時に
+「本当は違う選び方もあったのでは」
+という想いが心の奥に残っています。
+
+今、運命の流れは
+“これまでの延長”ではなく、
+「自分で選び直す方向」へと動き始めています。
+
+これからは、
+自分の感覚を信じて選択することで、
+流れは驚くほど軽くなっていきます。
+
+ここまでが今回の本鑑定です。
+
+また鑑定を希望するタイミングで、
+「鑑定して」
+と送ってください🔮
+"""
+
+# ========= Webhook =========
 @app.route("/callback", methods=["POST"])
 def callback():
     signature = request.headers["X-Line-Signature"]
     body = request.get_data(as_text=True)
+
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
         abort(400)
+
     return "OK"
 
-# =====================
-# メッセージ処理
-# =====================
+# ========= メイン処理 =========
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     user_id = event.source.user_id
     text = event.message.text.strip()
 
-    if user_id not in user_states or text == "リセット":
-        init_user(user_id)
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(
-                text=
-                "状況を把握するために【3つだけ】教えてください。\n\n"
-                "① 今いちばん気になっていること\n"
-                "② いつ頃からモヤモヤしていますか？\n"
-                "③ 最終的にどうなれたら理想ですか？\n\n"
-                "まとめて送っても、1つずつでも大丈夫です。"
-            )
-        )
-        return
+    if user_id not in user_state:
+        user_state[user_id] = {
+            "answers": [],
+            "plan": None,
+            "used": 0
+        }
 
-    state = user_states[user_id]
+    state = user_state[user_id]
 
-    # =====================
-    # 質問フェーズ
-    # =====================
-    if state["phase"] == "question":
-        answers = state["answers"]
+    # ---- 初回ヒアリング ----
+    if len(state["answers"]) < 3:
+        state["answers"].append(text)
 
-        if "1" not in answers:
-            answers["1"] = text
-        elif "2" not in answers:
-            answers["2"] = text
-        elif "3" not in answers:
-            answers["3"] = text
-
-        if len(answers) < 3:
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(text="ありがとうございます✨ 続けて教えてください。")
-            )
-            return
-
-        # 無料鑑定
-        state["phase"] = "free_done"
-        free_text = (
-            "無料鑑定をお届けします🔮\n\n"
-            "あなたの流れを見ると、今は\n"
-            "『一度立ち止まり、方向を整える時期』にいます。\n\n"
-            "気持ちの奥ではすでに答えが見えている一方で、\n"
-            "現実とのズレや周囲の影響により、\n"
-            "決断を先延ばしにしやすい状態です。\n\n"
-            "この時期は無理に動くより、\n"
-            "自分の本音を整理することで\n"
-            "次の選択が自然と見えてきます。\n\n"
-            "ここから先は、より深く読み解くことで\n"
-            "具体的な行動指針がはっきりしていきます。"
-        )
-
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(
-                text=free_text + "\n\n"
-                "ここから先は【有料鑑定】になります。\n\n"
+        if len(state["answers"]) < 3:
+            reply = "ありがとうございます✨ 残りも教えてください。"
+        else:
+            reply = (
+                FREE_READING_TEXT +
+                "\n\nここから先は【有料鑑定】になります。\n\n"
                 "番号かプラン名で選んでください👇\n"
-                "1️⃣ ライト\n"
-                "2️⃣ シルバー\n"
-                "3️⃣ ゴールド\n\n"
+                "1️⃣ ライト\n2️⃣ シルバー\n3️⃣ ゴールド\n\n"
                 "迷う場合は「おすすめ」と送ってください。"
             )
+
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=reply)
         )
         return
 
-    # =====================
-    # プラン選択
-    # =====================
-    if state["phase"] == "free_done":
+    # ---- プラン選択 ----
+    if state["plan"] is None:
         if text in ["1", "ライト"]:
             state["plan"] = "ライト"
-            state["remaining"] = 1
         elif text in ["2", "シルバー"]:
             state["plan"] = "シルバー"
-            state["remaining"] = 3
         elif text in ["3", "ゴールド"]:
             state["plan"] = "ゴールド"
-            state["remaining"] = 999
         elif text == "おすすめ":
-            state["plan"] = "シルバー"
-            state["remaining"] = 3
+            reply = "じっくり相談したい方には【シルバー】がおすすめです。"
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+            return
         else:
             return
 
-        state["phase"] = "payment"
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(
-                text=
-                f"{state['plan']}プランを選択しました✨\n\n"
-                "BASEショップでご購入後、\n"
-                "「購入しました」と送ってください。"
-            )
+        reply = (
+            f"{state['plan']}プランをお選びいただきありがとうございます✨\n\n"
+            f"こちらからご購入ください👇\n{BASE_LINKS[state['plan']]}\n\n"
+            "購入後「購入しました」と送ってください。"
         )
+
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
         return
 
-    # =====================
-    # 購入確認
-    # =====================
-    if state["phase"] == "payment" and text == "購入しました":
-        state["phase"] = "paid"
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(
-                text=
-                "ありがとうございます✨\n\n"
-                "本鑑定をご希望のタイミングで\n"
-                "「鑑定して」と送ってください🔮"
-            )
-        )
+    # ---- 購入確認 ----
+    if text == "購入しました":
+        reply = "ありがとうございます✨\n鑑定したいタイミングで「鑑定して」と送ってください。"
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
         return
 
-    # =====================
-    # 本鑑定
-    # =====================
-    if state["phase"] == "paid" and text == "鑑定して":
-        if state["remaining"] <= 0:
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(
-                    text=
-                    "このプランの鑑定回数は終了しました。\n\n"
-                    "🔄 継続する\n⬆️ ランクアップする\n\n"
-                    "場合は、プラン名を送ってください✨"
-                )
+    # ---- 本鑑定 ----
+    if text == "鑑定して":
+        if state["used"] >= PLAN_LIMITS[state["plan"]]:
+            reply = (
+                "このプランの鑑定回数は終了しました。\n\n"
+                "🔮 継続やランクアップも可能です。\n"
+                "1️⃣ ライト\n2️⃣ シルバー\n3️⃣ ゴールド\n\n"
+                "番号かプラン名で送ってください。"
             )
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
             return
 
-        state["remaining"] -= 1
-
-        result = (
-            "本鑑定をお届けします🔮\n\n"
-            "あなたは今、人生の流れが\n"
-            "『次の段階へ移行する直前』にいます。\n\n"
-            "これまで我慢してきたことや\n"
-            "飲み込んできた感情は、\n"
-            "決して無駄ではありません。\n\n"
-            "ここからは\n"
-            "「自分を優先する選択」を取ることで\n"
-            "運命の歯車が静かに噛み合っていきます。\n\n"
-            "焦らず、周囲と比べず、\n"
-            "あなたのペースで進んで大丈夫です。\n\n"
-            "今回の鑑定はここまでです✨"
-        )
-
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text=result)
-        )
+        state["used"] += 1
+        reply = PAID_READING_TEXT
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
         return
-
-# =====================
-# 起動
-# =====================
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
