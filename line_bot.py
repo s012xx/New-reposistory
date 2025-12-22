@@ -83,19 +83,39 @@ def handle_message(event):
     # 無料鑑定前ヒアリング
     # =====================
     if state["step"] == "ask_questions":
-        if "①" in text:
-            state["answers"]["q1"] = text
-        if "②" in text:
-            state["answers"]["q2"] = text
-        if "③" in text:
-            state["answers"]["q3"] = text
+    # まだ保存されていない質問に順番に入れる
+    if "q1" not in state["answers"]:
+        state["answers"]["q1"] = text
+    elif "q2" not in state["answers"]:
+        state["answers"]["q2"] = text
+    elif "q3" not in state["answers"]:
+        state["answers"]["q3"] = text
 
-        if len(state["answers"]) < 3:
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage("ありがとうございます✨ 残りも教えてください。")
-            )
-            return
+    # まだ3つ揃っていなければ続行
+    if len(state["answers"]) < 3:
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage("ありがとうございます✨ 続けて教えてください。")
+        )
+        return
+
+    # 3つ揃ったら無料鑑定へ
+    free_result = generate_free_fortune(state["answers"])
+    state["step"] = "free_done"
+    state["free_done"] = True
+
+    reply = (
+        free_result
+        + "\n\nここから先は【有料鑑定】になります。\n\n"
+          "番号かプラン名で選んでください👇\n"
+          "1️⃣ ライト\n"
+          "2️⃣ シルバー\n"
+          "3️⃣ ゴールド\n\n"
+          "迷う場合は「おすすめ」と送ってください。"
+    )
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(reply))
+    return
+
 
         # 無料鑑定へ
         free_result = generate_free_fortune(state["answers"])
@@ -145,3 +165,4 @@ def handle_message(event):
             "\n\n購入後、このトークに\n"
             "「購入しました」と送ってください✨"
         )
+
