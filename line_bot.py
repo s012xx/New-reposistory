@@ -1,150 +1,56 @@
 import os
+import re
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
-from linebot.models import MessageEvent, TextMessage, TextSendMessage
 from linebot.exceptions import InvalidSignatureError
+from linebot.models import MessageEvent, TextMessage, TextSendMessage
 from openai import OpenAI
 
-# =====================
+# =========================
 # 環境変数チェック
-# =====================
+# =========================
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 if not all([LINE_CHANNEL_SECRET, LINE_CHANNEL_ACCESS_TOKEN, OPENAI_API_KEY]):
-    raise RuntimeError(
-        "環境変数が不足しています。 "
-        "LINE_CHANNEL_SECRET / LINE_CHANNEL_ACCESS_TOKEN / OPENAI_API_KEY を設定してください。"
-    )
+    raise RuntimeError("環境変数が不足しています")
 
-# =====================
+# =========================
 # 初期化
-# =====================
+# =========================
 app = Flask(__name__)
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# =====================
-# ユーザー状態管理
-# =====================
+# =========================
+# 簡易セッション管理（ユーザーごと）
+# =========================
 user_states = {}
 
 def get_state(user_id):
     if user_id not in user_states:
         user_states[user_id] = {
-            "step": "start",
-            "answers": {},
-            "selected_plan": None
+            "phase": "start",
+            "answers": [],
+            "free_done": False
         }
     return user_states[user_id]
 
 def reset_state(user_id):
     user_states[user_id] = {
-        "step": "start",
-        "answers": {},
-        "selected_plan": None
+        "phase": "start",
+        "answers": [],
+        "free_done": False
     }
 
-# =====================
-# メッセージ生成
-# =====================
-def start_message():
-    return (
-        "はじめまして🔮 運命ナビ占い・フォーチュンです。\n\n"
-        "まずは【無料鑑定】から始めます。\n"
-        "状況を把握するために、次の【3つ】を教えてください。\n\n"
-        "① 今いちばん気になっていること\n"
-        "② いつ頃からモヤモヤしていますか？\n"
-        "③ 最終的にどうなれたら理想ですか？\n\n"
-        "※まとめて送っても、1つずつでも大丈夫です。"
-    )
-
-def need_more_answers(state):
-    missing = [q for q in ["1", "2", "3"] if q not in state["answers"]]
-    return missing
-
-def free_result_message():
-    return (
-        "🔮【無料鑑定結果】\n\n"
-        "今のあなたは「気持ちと現実のズレ」に気づき始めている段階です。\n"
-        "流れ自体は止まっていませんが、判断を先送りにしやすい時期。\n\n"
-        "このまま曖昧にすると、同じ悩みを繰り返しやすい暗示があります。\n"
-        "ただし、ポイントを整理すれば流れは十分に変えられます。\n\n"
-        "ここまでが【無料鑑定】です✨"
-    )
-
-def plan_simple_message():
-    return (
-        "ここから先は【有料鑑定】になります。\n\n"
-        "番号かプラン名で選んでください👇\n"
-        "1️⃣ ライト\n"
-        "2️⃣ シルバー\n"
-        "3️⃣ ゴールド\n\n"
-        "迷う場合は「おすすめ」と送ってください。"
-    )
-
-def plan_detail_message():
-    return (
-        "【プラン詳細】\n\n"
-        "1️⃣ ライト（2,000円）\n"
-        "・1テーマを丁寧に鑑定\n"
-        "・現状整理と近い未来を明確にしたい方\n\n"
-        "2️⃣ シルバー（4,000円 / 2週間・3回）\n"
-        "・状況が動くたびに再鑑定OK\n"
-        "・恋愛や人間関係の変化が気になる方\n\n"
-        "3️⃣ ゴールド（6,000円 / 2週間）\n"
-        "・相談し放題\n"
-        "・人生全体を整えたい方"
-    )
-
-def payment_message(plan):
-    links = {
-        "light": "https://fortune907.base.shop/items/128865860",
-        "silver": "https://fortune907.base.shop/items/128866117",
-        "gold": "https://fortune907.base.shop/items/128866188"
-    }
-
-    names = {
-        "light": "ライトプラン（2,000円）",
-        "silver": "シルバープラン（4,000円）",
-        "gold": "ゴールドプラン（6,000円）"
-    }
-
-    return (
-        f"✨ {names[plan]} を選びました。\n\n"
-        "以下のBASEショップからお支払いをお願いします👇\n"
-        f"{links[plan]}\n\n"
-        "お支払い完了後、\n"
-        "【支払いました】と送ってください。\n"
-        "確認後、本鑑定に入ります🔮"
-    )
-
-def paid_hearing_message():
-    return (
-        "ありがとうございます✨\n\n"
-        "それでは【本鑑定】に入ります。\n"
-        "鑑定したいテーマや、特に深く知りたい点があれば教えてください。\n\n"
-        "（例：相手の気持ち／今後の展開／選択の判断など）"
-    )
-
-def generate_paid_reading(prompt):
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": "あなたは経験豊富な占い師です。核心を突きつつ、丁寧で現実的な鑑定を行ってください。"},
-            {"role": "user", "content": prompt}
-        ]
-    )
-    return response.choices[0].message.content
-
-# =====================
+# =========================
 # Webhook
-# =====================
+# =========================
 @app.route("/callback", methods=["POST"])
 def callback():
-    signature = request.headers["X-Line-Signature"]
+    signature = request.headers.get("X-Line-Signature")
     body = request.get_data(as_text=True)
 
     try:
@@ -154,115 +60,183 @@ def callback():
 
     return "OK"
 
+# =========================
+# メッセージ受信
+# =========================
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     user_id = event.source.user_id
     text = event.message.text.strip()
     state = get_state(user_id)
 
-    # リセット
-    if text.lower() in ["リセット", "reset"]:
+    # ---------- リセット ----------
+    if text.lower() in ["reset", "リセット"]:
         reset_state(user_id)
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text="リセットしました。最初から始めます🔁\n\n" + start_message())
-        )
+        reply(event, "状態をリセットしました。\n最初から始めますね✨")
+        send_menu(event)
         return
 
-    # スタート
-    if state["step"] == "start":
-        state["step"] = "free_hearing"
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=start_message()))
+    # ---------- 開始 ----------
+    if state["phase"] == "start":
+        send_menu(event)
+        state["phase"] = "menu"
         return
 
-    # 無料ヒアリング（3項目揃うまで待つ）
-    if state["step"] == "free_hearing":
-        if "1" not in state["answers"]:
-            state["answers"]["1"] = text
-        elif "2" not in state["answers"]:
-            state["answers"]["2"] = text
-        elif "3" not in state["answers"]:
-            state["answers"]["3"] = text
-
-        missing = need_more_answers(state)
-        if missing:
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(text="ありがとうございます。続けて教えてください✨")
-            )
+    # ---------- メニュー選択 ----------
+    if state["phase"] == "menu":
+        if re.search(r"恋愛|1", text):
+            topic = "恋愛"
+        elif re.search(r"相性|2", text):
+            topic = "相性"
+        elif re.search(r"仕事|生き方|3", text):
+            topic = "仕事・生き方"
+        elif re.search(r"性格|本質|4", text):
+            topic = "性格・本質"
+        elif re.search(r"手相|5", text):
+            reply(event, "手相鑑定は画像を送ってください📷")
             return
         else:
-            state["step"] = "free_result"
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(text=free_result_message())
-            )
+            reply(event, "番号またはメニュー名で選んでくださいね✨")
             return
 
-    # プラン案内
-    if state["step"] == "free_result":
-        state["step"] = "wait_plan"
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text=plan_simple_message())
+        state["topic"] = topic
+        state["phase"] = "hearing"
+        reply(
+            event,
+            f"{topic}について鑑定しますね。\n\n"
+            "状況を把握するために【3つだけ】教えてください。\n\n"
+            "① 今いちばん気になっていること\n"
+            "② いつ頃からモヤモヤしていますか？\n"
+            "③ 最終的にどうなれたら理想ですか？\n\n"
+            "まとめて送っても、1つずつでも大丈夫です。"
         )
         return
 
-    # プラン選択
-    if state["step"] == "wait_plan":
-        t = text.lower()
-        if t in ["1", "ライト", "light"]:
-            plan = "light"
-        elif t in ["2", "シルバー", "silver"]:
-            plan = "silver"
-        elif t in ["3", "ゴールド", "gold"]:
-            plan = "gold"
-        elif "おすすめ" in t:
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(text="迷ったら【シルバー】がおすすめです。\n\n" + plan_detail_message())
-            )
+    # ---------- ヒアリング ----------
+    if state["phase"] == "hearing":
+        state["answers"].append(text)
+
+        if len(state["answers"]) < 3:
+            reply(event, f"ありがとうございます✨\n（あと {3 - len(state['answers'])} つです）")
             return
+
+        # 無料鑑定
+        result = generate_fortune(state["topic"], state["answers"], deep=False)
+        reply(event, result)
+
+        state["free_done"] = True
+        state["phase"] = "paid_guide"
+
+        # 🔽 必ず有料案内を出す
+        reply(
+            event,
+            "ここから先は【有料鑑定】になります。\n\n"
+            "番号かプラン名で選んでください👇\n"
+            "1️⃣ ライト\n"
+            "2️⃣ シルバー\n"
+            "3️⃣ ゴールド\n\n"
+            "迷う場合は「おすすめ」と送ってください。"
+        )
+        return
+
+    # ---------- 有料プラン案内 ----------
+    if state["phase"] == "paid_guide":
+        if re.search(r"1|ライト", text):
+            send_light(event)
+        elif re.search(r"2|シルバー", text):
+            send_silver(event)
+        elif re.search(r"3|ゴールド", text):
+            send_gold(event)
+        elif re.search(r"おすすめ", text):
+            reply(
+                event,
+                "今の状況をしっかり整えたいなら【シルバー】がおすすめです✨\n"
+                "継続的に流れを見られるので安心感があります。"
+            )
+            send_silver(event)
         else:
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(text="番号（1〜3）かプラン名で選んでください😊")
-            )
-            return
-
-        state["selected_plan"] = plan
-        state["step"] = "wait_payment"
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text=payment_message(plan))
-        )
+            reply(event, "番号・プラン名・おすすめ のいずれかで送ってください✨")
         return
 
-    # 支払い待ち
-    if state["step"] == "wait_payment":
-        if "支払" in text:
-            state["step"] = "paid_hearing"
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(text=paid_hearing_message())
-            )
-        else:
-            line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(text="お支払い後に【支払いました】と送ってください✨")
-            )
-        return
+# =========================
+# メニュー表示
+# =========================
+def send_menu(event):
+    reply(
+        event,
+        "🔮 運命ナビ占い・フォーチュンへようこそ ✨\n\n"
+        "番号で選んでください👇\n"
+        "1️⃣ 恋愛\n"
+        "2️⃣ 相性\n"
+        "3️⃣ 仕事・生き方\n"
+        "4️⃣ 性格・本質\n"
+        "5️⃣ 手相（画像送信）\n\n"
+        "まずは【無料鑑定1回】受けられます🌙"
+    )
 
-    # 本鑑定
-    if state["step"] == "paid_hearing":
-        reading = generate_paid_reading(text)
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text=reading)
-        )
-        return
+# =========================
+# プラン案内
+# =========================
+def send_light(event):
+    reply(
+        event,
+        "✨ライトプラン（2,000円）\n"
+        "・1テーマを丁寧に鑑定\n\n"
+        "PayPay表示名が【paypay-◯◯】の形になるよう設定し、\n"
+        "お支払い後に「支払いました」と送ってください✨"
+    )
 
+def send_silver(event):
+    reply(
+        event,
+        "✨シルバープラン（5,000円）\n"
+        "・2週間以内に【3回】鑑定\n\n"
+        "PayPay表示名が【paypay-◯◯】の形になるよう設定し、\n"
+        "お支払い後に「支払いました」と送ってください✨"
+    )
 
+def send_gold(event):
+    reply(
+        event,
+        "✨ゴールドプラン（15,000円）\n"
+        "・2週間 相談し放題\n\n"
+        "PayPay表示名が【paypay-◯◯】の形になるよう設定し、\n"
+        "お支払い後に「支払いました」と送ってください✨"
+    )
+
+# =========================
+# 占い生成
+# =========================
+def generate_fortune(topic, answers, deep=False):
+    prompt = f"""
+あなたは落ち着いた視点で核心を突く占い師です。
+スピリチュアルすぎず、現実的で前向きな鑑定を行ってください。
+
+テーマ：{topic}
+相談内容：
+{answers}
+
+{'有料鑑定なので深く具体的に鑑定してください。' if deep else '無料鑑定なので要点を簡潔に。'}
+"""
+
+    res = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return res.choices[0].message.content
+
+# =========================
+# 返信共通
+# =========================
+def reply(event, text):
+    line_bot_api.reply_message(
+        event.reply_token,
+        TextSendMessage(text=text)
+    )
+
+# =========================
+# 起動
+# =========================
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
 
